@@ -106,17 +106,11 @@ async def _vector_search(request: Request, query: str) -> list[SearchResult] | N
         )
     response = await request.app.client.search(
         index="wines",
-        size=10,
-        query={
-            "script_score": {
-                "query": {"match_all": {}},
-                "script": {
-                    "source": "cosineSimilarity(params.queryVector, 'vector') + 1.0",
-                    "params": {
-                        "queryVector": query_vector.astype("float32", copy=False).tolist(),
-                    },
-                },
-            }
+        knn={
+            "field": "vector",
+            "query_vector": query_vector.astype("float32", copy=False).tolist(),
+            "k": 10,
+            "num_candidates": 100,
         },
         _source=["id", "title", "description", "country", "variety", "price", "points"],
     )

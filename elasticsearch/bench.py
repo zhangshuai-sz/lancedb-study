@@ -18,9 +18,10 @@ except ImportError:
 
 QUERY_FILES = {
     "fts": "keyword_terms.txt",
-    "vector": "vector_terms.txt",
+    "vector": "keyword_terms.txt",
+    "hybrid": "keyword_terms.txt",
 }
-SEARCH_TYPES = ("fts", "vector")
+SEARCH_TYPES = ("fts", "vector", "hybrid")
 NUM_QUERIES = 1000
 NUM_TRIALS = 3
 DEFAULT_SEED = 37
@@ -72,36 +73,67 @@ async def run_es_fts_query(client: AsyncElasticsearch, query_text: str) -> bool:
     return bool(response["hits"].get("hits"))
 
 
-async def run_es_vector_query(
+def precompute_vectors(
     model: SentenceTransformer,
-    client: AsyncElasticsearch,
-    query_text: str,
-) -> bool:
-    query_vector = model.encode(
-        f"search_query: {query_text.strip().lower()}",
-        show_progress_bar=False,
-        convert_to_numpy=True,
-        truncate_dim=EMBEDDING_DIM,
-    )
-    if len(query_vector.shape) != 1 or query_vector.shape[0] != EMBEDDING_DIM:
-        raise ValueError(
-            f"Expected query embedding shape ({EMBEDDING_DIM},), got {query_vector.shape}"
+    query_texts: list[str],
+) -> dict[str, list[float]]:
+    """预先批量编码所有查询词向量，排除 model.encode() 对压测计时的影响。"""
+    vectors = {}
+    for text in set(query_texts):
+        vec = model.encode(
+            f"search_query: {text.strip().lower()}",
+            show_progress_bar=False,
+            convert_to_numpy=True,
+            truncate_dim=EMBEDDING_DIM,
         )
+        if len(vec.shape) != 1 or vec.shape[0] != EMBEDDING_DIM:
+            raise ValueError(
+                f"Expected query embedding shape ({EMBEDDING_DIM},), got {vec.shape}"
+            )
+        vectors[text] = vec.astype("float32", copy=False).tolist()
+    return vectors
 
+
+async def run_es_vector_query(
+    client: AsyncElasticsearch,
+    query_vector: list[float],
+) -> bool:
+    """纯检索压测：使用 knn 查询利用 HNSW 索引，只计算 ES 检索耗时。"""
     response = await client.search(
         index="wines",
-        size=10,
+        knn={
+            "field": "vector",
+            "query_vector": query_vector,
+            "k": 10,
+            "num_candidates": 100,
+        },
+        _source=RESULT_COLUMNS,
+    )
+    return bool(response["hits"].get("hits"))
+
+
+async def run_es_hybrid_query(
+    client: AsyncElasticsearch,
+    query_text: str,
+    query_vector: list[float],
+) -> bool:
+    """混合检索压测：同时使用 knn 向量检索和 match 文本检索，由 ES 融合排序。"""
+    response = await client.search(
+        index="wines",
+        knn={
+            "field": "vector",
+            "query_vector": query_vector,
+            "k": 10,
+            "num_candidates": 100,
+        },
         query={
-            "script_score": {
-                "query": {"match_all": {}},
-                "script": {
-                    "source": "cosineSimilarity(params.queryVector, 'vector') + 1.0",
-                    "params": {
-                        "queryVector": query_vector.astype("float32", copy=False).tolist(),
-                    },
-                },
+            "match": {
+                "description": {
+                    "query": query_text,
+                }
             }
         },
+        size=10,
         _source=RESULT_COLUMNS,
     )
     return bool(response["hits"].get("hits"))
@@ -165,7 +197,7 @@ async def run_benchmark(args: argparse.Namespace) -> None:
 
     print(
         f"Averaged metrics over {NUM_TRIALS} direct-client runs "
-        f"for {NUM_QUERIES} queries per search type (fts, vector)."
+        f"for {NUM_QUERIES} queries per search type (fts, vector, hybrid)."
     )
     print(
         "| search | queries | runs | success_avg | elapsed_s_avg | qps_avg | "
@@ -173,16 +205,25 @@ async def run_benchmark(args: argparse.Namespace) -> None:
     )
     print("|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|")
 
-    for i, search_type in enumerate(SEARCH_TYPES):
-        terms = get_query_terms(search_type)
-        rng = random.Random(args.seed + i)
-        sampled_queries = rng.choices(terms, k=NUM_QUERIES)
-        warmup_queries = [terms[j % len(terms)] for j in range(args.warmup_queries)]
+    # 三种检索类型共用同一份查询文本，保证压测对比的公平性
+    terms = get_query_terms("fts")  # 所有类型都使用 keyword_terms.txt
+    rng = random.Random(args.seed)
+    sampled_queries = rng.choices(terms, k=NUM_QUERIES)
+    warmup_queries = [terms[j % len(terms)] for j in range(args.warmup_queries)]
 
+    # 预先批量编码所有查询词向量（向量检索和混合检索共用）
+    all_texts = list(set(sampled_queries + warmup_queries))
+    print(f"Pre-computing {len(all_texts)} unique query vectors (excluded from timing)...")
+    vector_cache = precompute_vectors(model, all_texts)
+    print("Vector pre-computation done.")
+
+    for search_type in SEARCH_TYPES:
         if search_type == "fts":
             query_runner = lambda query: run_es_fts_query(client, query)
+        elif search_type == "vector":
+            query_runner = lambda query: run_es_vector_query(client, vector_cache[query])
         else:
-            query_runner = lambda query: run_es_vector_query(model, client, query)
+            query_runner = lambda query: run_es_hybrid_query(client, query, vector_cache[query])
 
         all_trial_metrics: list[dict[str, float]] = []
         for _ in range(NUM_TRIALS):

@@ -4,7 +4,9 @@ import argparse
 import asyncio
 import os
 import random
+import sys
 import warnings
+from datetime import datetime
 from functools import lru_cache
 from pathlib import Path
 from time import perf_counter
@@ -21,11 +23,15 @@ try:
 except ImportError:
     from config import Settings
 
+# 日志输出文件路径（固定位置）
+LOG_FILE = Path(__file__).resolve().parents[1] / "bench_output.log"
+
 QUERY_FILES = {
     "fts": "keyword_terms.txt",
-    "vector": "vector_terms.txt",
+    "vector": "keyword_terms.txt",
+    "hybrid": "keyword_terms.txt",
 }
-SEARCH_TYPES = ("fts", "vector")
+SEARCH_TYPES = ("fts", "vector", "hybrid")
 NUM_QUERIES = 1000
 NUM_TRIALS = 3
 DEFAULT_SEED = 37
@@ -33,6 +39,7 @@ EMBEDDING_DIM = 256
 RESULT_COLUMNS = ["id", "title", "description", "country", "variety", "price", "points"]
 FTS_RESULT_COLUMNS = [*RESULT_COLUMNS, "_score"]
 VECTOR_RESULT_COLUMNS = [*RESULT_COLUMNS, "_distance"]
+HYBRID_RESULT_COLUMNS = [*RESULT_COLUMNS, "_score"]
 
 
 @lru_cache()
@@ -73,24 +80,34 @@ async def run_lancedb_fts_query(table: lancedb.table.AsyncTable, query_text: str
     return result_table.num_rows > 0
 
 
-async def run_lancedb_vector_query(
+def precompute_vectors(
     model: SentenceTransformer,
-    table: lancedb.table.AsyncTable,
-    query_text: str,
-) -> bool:
-    query_vector = model.encode(
-        f"search_query: {query_text.strip().lower()}",
-        show_progress_bar=False,
-        convert_to_numpy=True,
-        truncate_dim=EMBEDDING_DIM,
-    )
-    if len(query_vector.shape) != 1 or query_vector.shape[0] != EMBEDDING_DIM:
-        raise ValueError(
-            f"Expected query embedding shape ({EMBEDDING_DIM},), got {query_vector.shape}"
+    query_texts: list[str],
+) -> dict[str, list[float]]:
+    """预先批量编码所有查询词向量，排除 model.encode() 对压测计时的影响。"""
+    vectors = {}
+    for text in set(query_texts):
+        vec = model.encode(
+            f"search_query: {text.strip().lower()}",
+            show_progress_bar=False,
+            convert_to_numpy=True,
+            truncate_dim=EMBEDDING_DIM,
         )
+        if len(vec.shape) != 1 or vec.shape[0] != EMBEDDING_DIM:
+            raise ValueError(
+                f"Expected query embedding shape ({EMBEDDING_DIM},), got {vec.shape}"
+            )
+        vectors[text] = vec.astype("float32", copy=False).tolist()
+    return vectors
 
+
+async def run_lancedb_vector_query(
+    table: lancedb.table.AsyncTable,
+    query_vector: list[float],
+) -> bool:
+    """纯检索压测：只计算 LanceDB 检索耗时，不包含 model.encode() 时间。"""
     query = await table.search(
-        query_vector.astype("float32", copy=False).tolist(),
+        query_vector,
         vector_column_name="vector",
         query_type="vector",
     )
@@ -101,6 +118,27 @@ async def run_lancedb_vector_query(
         .limit(10)
         .to_arrow()
     )
+    return result_table.num_rows > 0
+
+
+async def run_lancedb_hybrid_query(
+    table: lancedb.table.AsyncTable,
+    query_text: str,
+    query_vector: list[float],
+) -> bool:
+    """混合检索压测：同时使用 FTS 文本检索和向量检索，由 LanceDB 融合排序。
+    直接使用底层 query() API 传入预计算向量，避免 search() 要求文本输入的限制。"""
+    builder = (
+        table.query()
+        .nearest_to(query_vector)
+        .column("vector")
+        .distance_type("cosine")
+        .nprobes(10)
+        .nearest_to_text(query_text, columns=["description"])
+        .select(RESULT_COLUMNS)
+        .limit(10)
+    )
+    result_table = await builder.to_arrow()
     return result_table.num_rows > 0
 
 
@@ -157,7 +195,7 @@ async def run_benchmark(args: argparse.Namespace) -> None:
 
     print(
         f"Average metrics over {NUM_TRIALS} direct-client runs "
-        f"for {NUM_QUERIES} queries per search type (fts, vector)."
+        f"for {NUM_QUERIES} queries per search type (fts, vector, hybrid)."
     )
     print(
         "| search | queries | runs | success_avg | elapsed_s_avg | qps_avg | "
@@ -165,16 +203,25 @@ async def run_benchmark(args: argparse.Namespace) -> None:
     )
     print("|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|")
 
-    for i, search_type in enumerate(SEARCH_TYPES):
-        terms = get_query_terms(search_type)
-        rng = random.Random(args.seed + i)
-        sampled_queries = rng.choices(terms, k=NUM_QUERIES)
-        warmup_queries = [terms[j % len(terms)] for j in range(args.warmup_queries)]
+    # 三种检索类型共用同一份查询文本，保证压测对比的公平性
+    terms = get_query_terms("fts")  # 所有类型都使用 keyword_terms.txt
+    rng = random.Random(args.seed)
+    sampled_queries = rng.choices(terms, k=NUM_QUERIES)
+    warmup_queries = [terms[j % len(terms)] for j in range(args.warmup_queries)]
 
+    # 预先批量编码所有查询词向量（向量检索和混合检索共用）
+    all_texts = list(set(sampled_queries + warmup_queries))
+    print(f"Pre-computing {len(all_texts)} unique query vectors (excluded from timing)...")
+    vector_cache = precompute_vectors(model, all_texts)
+    print("Vector pre-computation done.")
+
+    for search_type in SEARCH_TYPES:
         if search_type == "fts":
             query_runner = lambda query: run_lancedb_fts_query(table, query)
+        elif search_type == "vector":
+            query_runner = lambda query: run_lancedb_vector_query(table, vector_cache[query])
         else:
-            query_runner = lambda query: run_lancedb_vector_query(model, table, query)
+            query_runner = lambda query: run_lancedb_hybrid_query(table, query, vector_cache[query])
 
         all_trial_metrics: list[dict[str, float]] = []
         for _ in range(NUM_TRIALS):
@@ -220,4 +267,31 @@ if __name__ == "__main__":
     if parsed_args.warmup_queries < 0:
         raise ValueError("--warmup-queries must be >= 0")
 
-    asyncio.run(run_benchmark(parsed_args))
+    # 将控制台输出同时重定向到固定日志文件
+    log_file = open(LOG_FILE, "a", encoding="utf-8")
+    log_file.write(f"\n{'=' * 60}\n")
+    log_file.write(f"Benchmark started at {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n")
+    log_file.write(f"{'=' * 60}\n")
+
+    class TeeWriter:
+        """同时写入控制台和日志文件的输出流。"""
+        def __init__(self, console, file):
+            self.console = console
+            self.file = file
+
+        def write(self, msg):
+            self.console.write(msg)
+            self.file.write(msg)
+
+        def flush(self):
+            self.console.flush()
+            self.file.flush()
+
+    original_stdout = sys.stdout
+    sys.stdout = TeeWriter(original_stdout, log_file)
+    try:
+        asyncio.run(run_benchmark(parsed_args))
+    finally:
+        sys.stdout = original_stdout
+        log_file.close()
+        print(f"\n日志已保存到: {LOG_FILE}")
