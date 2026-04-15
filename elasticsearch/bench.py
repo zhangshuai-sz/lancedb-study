@@ -7,8 +7,6 @@ from functools import lru_cache
 from pathlib import Path
 from time import perf_counter
 
-from sentence_transformers import SentenceTransformer
-
 from elasticsearch import AsyncElasticsearch
 
 try:
@@ -25,8 +23,8 @@ SEARCH_TYPES = ("fts", "vector", "hybrid")
 NUM_QUERIES = 1000
 NUM_TRIALS = 3
 DEFAULT_SEED = 37
-EMBEDDING_DIM = 256
-RESULT_COLUMNS = ["id", "title", "description", "country", "variety", "price", "points"]
+EMBEDDING_DIM = 1024
+RESULT_COLUMNS = ["id", "title", "text", "url", "wiki_id", "views", "paragraph_id", "langs"]
 
 
 @lru_cache()
@@ -57,13 +55,41 @@ def percentile(values: list[float], p: float) -> float:
     return sorted_values[low] * (1.0 - weight) + sorted_values[high] * weight
 
 
-async def run_es_fts_query(client: AsyncElasticsearch, query_text: str) -> bool:
+async def fetch_random_vectors(
+    client: AsyncElasticsearch,
+    index_alias: str,
+    n: int,
+    seed: int,
+) -> list[list[float]]:
+    """从 ES 索引中随机抽取 n 条文档的向量，用作向量检索的查询向量。"""
     response = await client.search(
-        index="wines",
+        index=index_alias,
+        size=n,
+        query={
+            "function_score": {
+                "query": {"match_all": {}},
+                "random_score": {"seed": seed, "field": "_seq_no"},
+            }
+        },
+        _source=["vector"],
+    )
+    vectors = []
+    for hit in response["hits"]["hits"]:
+        vec = hit["_source"].get("vector")
+        if vec:
+            vectors.append(vec)
+    if not vectors:
+        raise RuntimeError("无法从 ES 中获取向量数据，请确认数据已导入")
+    return vectors
+
+
+async def run_es_fts_query(client: AsyncElasticsearch, index_alias: str, query_text: str) -> bool:
+    response = await client.search(
+        index=index_alias,
         size=10,
         query={
             "match": {
-                "description": {
+                "text": {
                     "query": query_text,
                 }
             }
@@ -73,34 +99,13 @@ async def run_es_fts_query(client: AsyncElasticsearch, query_text: str) -> bool:
     return bool(response["hits"].get("hits"))
 
 
-def precompute_vectors(
-    model: SentenceTransformer,
-    query_texts: list[str],
-) -> dict[str, list[float]]:
-    """预先批量编码所有查询词向量，排除 model.encode() 对压测计时的影响。"""
-    vectors = {}
-    for text in set(query_texts):
-        vec = model.encode(
-            f"search_query: {text.strip().lower()}",
-            show_progress_bar=False,
-            convert_to_numpy=True,
-            truncate_dim=EMBEDDING_DIM,
-        )
-        if len(vec.shape) != 1 or vec.shape[0] != EMBEDDING_DIM:
-            raise ValueError(
-                f"Expected query embedding shape ({EMBEDDING_DIM},), got {vec.shape}"
-            )
-        vectors[text] = vec.astype("float32", copy=False).tolist()
-    return vectors
-
-
 async def run_es_vector_query(
     client: AsyncElasticsearch,
+    index_alias: str,
     query_vector: list[float],
 ) -> bool:
-    """纯检索压测：使用 knn 查询利用 HNSW 索引，只计算 ES 检索耗时。"""
     response = await client.search(
-        index="wines",
+        index=index_alias,
         knn={
             "field": "vector",
             "query_vector": query_vector,
@@ -114,12 +119,12 @@ async def run_es_vector_query(
 
 async def run_es_hybrid_query(
     client: AsyncElasticsearch,
+    index_alias: str,
     query_text: str,
     query_vector: list[float],
 ) -> bool:
-    """混合检索压测：同时使用 knn 向量检索和 match 文本检索，由 ES 融合排序。"""
     response = await client.search(
-        index="wines",
+        index=index_alias,
         knn={
             "field": "vector",
             "query_vector": query_vector,
@@ -128,7 +133,7 @@ async def run_es_hybrid_query(
         },
         query={
             "match": {
-                "description": {
+                "text": {
                     "query": query_text,
                 }
             }
@@ -184,7 +189,7 @@ def average_metrics(metrics_list: list[dict[str, float]]) -> dict[str, float]:
 
 async def run_benchmark(args: argparse.Namespace) -> None:
     settings = get_settings()
-    model = SentenceTransformer(settings.embedding_model_checkpoint)
+    index_alias = settings.elastic_index_alias
 
     client = AsyncElasticsearch(
         f"http://{settings.elastic_url}:{settings.elastic_port}",
@@ -205,25 +210,38 @@ async def run_benchmark(args: argparse.Namespace) -> None:
     )
     print("|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|")
 
-    # 三种检索类型共用同一份查询文本，保证压测对比的公平性
-    terms = get_query_terms("fts")  # 所有类型都使用 keyword_terms.txt
+    # 三种检索类型共用同一份查询文本
+    terms = get_query_terms("fts")
     rng = random.Random(args.seed)
     sampled_queries = rng.choices(terms, k=NUM_QUERIES)
     warmup_queries = [terms[j % len(terms)] for j in range(args.warmup_queries)]
 
-    # 预先批量编码所有查询词向量（向量检索和混合检索共用）
-    all_texts = list(set(sampled_queries + warmup_queries))
-    print(f"Pre-computing {len(all_texts)} unique query vectors (excluded from timing)...")
-    vector_cache = precompute_vectors(model, all_texts)
-    print("Vector pre-computation done.")
+    # 从 ES 中随机抽取向量作为查询向量（向量检索和混合检索共用）
+    print(f"从 ES 中随机抽取 {NUM_QUERIES} 条向量用于向量检索 ...")
+    all_vectors = await fetch_random_vectors(client, index_alias, NUM_QUERIES, args.seed)
+    # 如果抽取的向量不够，循环复用
+    while len(all_vectors) < NUM_QUERIES:
+        all_vectors.extend(all_vectors[: NUM_QUERIES - len(all_vectors)])
+    all_vectors = all_vectors[:NUM_QUERIES]
+    # 为每个查询文本分配一个向量
+    query_vector_map = {q: all_vectors[i] for i, q in enumerate(sampled_queries)}
+    # warmup 也需要向量
+    for j, wq in enumerate(warmup_queries):
+        if wq not in query_vector_map:
+            query_vector_map[wq] = all_vectors[j % len(all_vectors)]
+    print("向量准备完成。")
 
     for search_type in SEARCH_TYPES:
         if search_type == "fts":
-            query_runner = lambda query: run_es_fts_query(client, query)
+            query_runner = lambda query: run_es_fts_query(client, index_alias, query)
         elif search_type == "vector":
-            query_runner = lambda query: run_es_vector_query(client, vector_cache[query])
+            query_runner = lambda query: run_es_vector_query(
+                client, index_alias, query_vector_map[query]
+            )
         else:
-            query_runner = lambda query: run_es_hybrid_query(client, query, vector_cache[query])
+            query_runner = lambda query: run_es_hybrid_query(
+                client, index_alias, query, query_vector_map[query]
+            )
 
         all_trial_metrics: list[dict[str, float]] = []
         for _ in range(NUM_TRIALS):

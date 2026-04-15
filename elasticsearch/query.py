@@ -1,4 +1,4 @@
-"""Run fixed FTS and vector queries for qualitative inspection."""
+"""运行 FTS 查询进行定性检查。"""
 
 import asyncio
 from pathlib import Path
@@ -12,7 +12,6 @@ API_PORT = 8000
 
 QUERY_FILES = {
     "fts": "keyword_terms.txt",
-    "vector": "vector_terms.txt",
 }
 
 
@@ -52,7 +51,7 @@ async def run_search(queries: list[str], endpoint: str) -> None:
 
     for i, item in enumerate(results):
         if item:
-            print(f"Query [{queries[i]}]: {item[0]['description']}")
+            print(f"Query [{queries[i]}]: {item[0]['text'][:100]}...")
         else:
             print(f"Query [{queries[i]}]: <no result>")
     print(f"Ran search in: {elapsed:.4f} sec")
@@ -60,12 +59,7 @@ async def run_search(queries: list[str], endpoint: str) -> None:
 
 async def main() -> None:
     fts_endpoint = f"http://{API_URL}:{API_PORT}/fts_search"
-    await run_search(get_query_terms("fts"), fts_endpoint)
-
-    print("\n" + "-" * 80 + "\n")
-
-    vector_endpoint = f"http://{API_URL}:{API_PORT}/vector_search"
-    await run_search(get_query_terms("vector"), vector_endpoint)
+    await run_search(get_query_terms("fts")[:20], fts_endpoint)
 
 
 if __name__ == "__main__":

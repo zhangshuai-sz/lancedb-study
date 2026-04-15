@@ -1,28 +1,26 @@
 """
-FastAPI app to serve search endpoints
+FastAPI app to serve Wikipedia search endpoints on Elasticsearch
 """
 from collections.abc import AsyncGenerator
 from contextlib import asynccontextmanager
 from functools import lru_cache
 
 from fastapi import FastAPI, HTTPException, Query, Request
-from sentence_transformers import SentenceTransformer
 
 from elasticsearch import AsyncElasticsearch
 
 try:
     from .config import Settings
-    from .schemas.wine import SearchResult
+    from .schemas.wikipedia import SearchResult
 except ImportError:
     from config import Settings
-    from schemas.wine import SearchResult
+    from schemas.wikipedia import SearchResult
 
-EMBEDDING_DIM = 256
+EMBEDDING_DIM = 1024
 
 
 @lru_cache()
 def get_settings():
-    # Use lru_cache to avoid loading .env file for every request
     return Settings()
 
 
@@ -30,7 +28,6 @@ def get_settings():
 async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
     """Async context manager for Elasticsearch connection."""
     settings = get_settings()
-    app.model = SentenceTransformer(settings.embedding_model_checkpoint)
 
     username = settings.elastic_user
     password = settings.elastic_password
@@ -45,28 +42,25 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
         verify_certs=False,
     )
     app.client = elastic_client
-    print("Successfully connected to Elasticsearch")
+    app.index_alias = settings.elastic_index_alias
+    print("成功连接到 Elasticsearch")
     yield
     await elastic_client.close()
-    print("Successfully closed Elasticsearch connection")
+    print("已关闭 Elasticsearch 连接")
 
 
 app = FastAPI(
-    title="REST API for wine reviews on Elasticsearch",
-    description=(
-        "Query from an Elasticsearch index of 130k wine reviews from the Wine Enthusiast magazine"
-    ),
-    version="0.1.0",
+    title="REST API for Wikipedia search on Elasticsearch",
+    description="基于 Cohere Wikipedia 数据集的 Elasticsearch 检索 API",
+    version="0.2.0",
     lifespan=lifespan,
 )
-
-# --- app ---
 
 
 @app.get("/", include_in_schema=False)
 async def root():
     return {
-        "message": "REST API for querying Elasticsearch index of 130k wine reviews from the Wine Enthusiast magazine"
+        "message": "REST API for querying Elasticsearch index of Wikipedia articles"
     }
 
 
@@ -75,16 +69,16 @@ async def root():
 
 async def _fts_search(request: Request, query: str) -> list[SearchResult] | None:
     response = await request.app.client.search(
-        index="wines",
+        index=request.app.index_alias,
         size=10,
         query={
             "match": {
-                "description": {
+                "text": {
                     "query": query,
                 }
             }
         },
-        _source=["id", "title", "description", "country", "variety", "price", "points"],
+        _source=["id", "title", "text", "url", "wiki_id", "views", "paragraph_id", "langs"],
     )
     result = response["hits"].get("hits")
     if result:
@@ -93,26 +87,16 @@ async def _fts_search(request: Request, query: str) -> list[SearchResult] | None
         return None
 
 
-async def _vector_search(request: Request, query: str) -> list[SearchResult] | None:
-    query_vector = request.app.model.encode(
-        f"search_query: {query.strip().lower()}",
-        show_progress_bar=False,
-        convert_to_numpy=True,
-        truncate_dim=EMBEDDING_DIM,
-    )
-    if len(query_vector.shape) != 1 or query_vector.shape[0] != EMBEDDING_DIM:
-        raise ValueError(
-            f"Expected query embedding shape ({EMBEDDING_DIM},), got {query_vector.shape}"
-        )
+async def _vector_search(request: Request, query: str, query_vector: list[float]) -> list[SearchResult] | None:
     response = await request.app.client.search(
-        index="wines",
+        index=request.app.index_alias,
         knn={
             "field": "vector",
-            "query_vector": query_vector.astype("float32", copy=False).tolist(),
+            "query_vector": query_vector,
             "k": 10,
             "num_candidates": 100,
         },
-        _source=["id", "title", "description", "country", "variety", "price", "points"],
+        _source=["id", "title", "text", "url", "wiki_id", "views", "paragraph_id", "langs"],
     )
     result = response["hits"].get("hits")
     if result:
@@ -127,20 +111,17 @@ async def _vector_search(request: Request, query: str) -> list[SearchResult] | N
 @app.get(
     "/fts_search",
     response_model=list[SearchResult],
-    response_description="Search for wines via full-text keywords",
+    response_description="通过全文关键词搜索 Wikipedia 文章",
 )
 async def fts_search(
     request: Request,
-    query: str = Query(
-        description="Specify terms to search for in the variety, title and description"
-    ),
+    query: str = Query(description="搜索关键词"),
 ) -> list[SearchResult] | None:
     result = await _fts_search(request, query)
-
     if not result:
         raise HTTPException(
             status_code=404,
-            detail=f"No wine with the provided terms '{query}' found in database - please try again",
+            detail=f"未找到与 '{query}' 相关的文章",
         )
     return result
 
@@ -148,18 +129,16 @@ async def fts_search(
 @app.get(
     "/vector_search",
     response_model=list[SearchResult],
-    response_description="Search for wines via semantically similar terms",
+    response_description="通过语义向量搜索 Wikipedia 文章（需要传入预计算的查询向量）",
 )
 async def vector_search(
     request: Request,
-    query: str = Query(
-        description="Specify terms to search for in the variety, title and description"
-    ),
+    query: str = Query(description="搜索文本（当前版本需要外部提供向量，此参数仅用于展示）"),
 ) -> list[SearchResult] | None:
-    result = await _vector_search(request, query)
-    if not result:
-        raise HTTPException(
-            status_code=404,
-            detail=f"No wine with the provided terms '{query}' found in database - please try again",
-        )
-    return result
+    # 注意：由于数据集使用 Cohere 模型生成的向量，
+    # 实际生产中应使用 Cohere API 对查询文本做 embedding。
+    # 这里暂时使用 FTS 作为 fallback。
+    raise HTTPException(
+        status_code=501,
+        detail="向量搜索需要 Cohere embedding API 对查询文本编码，请使用 bench.py 中的预计算向量进行测试",
+    )

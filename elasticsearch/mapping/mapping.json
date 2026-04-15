@@ -10,29 +10,18 @@
                     ]
                 }
             }
-        }
+        },
+        "number_of_shards": 6,
+        "number_of_replicas": 0,
+        "refresh_interval": "-1"
     },
     "mappings": {
         "properties": {
             "id": {
                 "type": "keyword"
             },
-            "points": {
-                "type": "unsigned_long"
-            },
             "title": {
                 "type": "text",
-                "analyzer": "custom_analyzer"
-            },
-            "description": {
-                "type": "text",
-                "analyzer": "custom_analyzer"
-            },
-            "price": {
-                "type": "half_float"
-            },
-            "variety": {
-                "type": "text",
                 "analyzer": "custom_analyzer",
                 "fields": {
                     "raw": {
@@ -40,72 +29,36 @@
                     }
                 }
             },
-            "winery": {
-                "type": "text",
-                "analyzer": "custom_analyzer",
-                "fields": {
-                    "raw": {
-                        "type": "keyword"
-                    }
-                }
-            },
-            "vineyard": {
+            "text": {
                 "type": "text",
                 "analyzer": "custom_analyzer"
             },
-            "country": {
-                "type": "text",
-                "analyzer": "custom_analyzer",
-                "fields": {
-                    "raw": {
-                        "type": "keyword"
-                    }
-                }
+            "url": {
+                "type": "keyword",
+                "index": false
             },
-            "province": {
-                "type": "text",
-                "analyzer": "custom_analyzer",
-                "fields": {
-                    "raw": {
-                        "type": "keyword"
-                    }
-                }
+            "wiki_id": {
+                "type": "long"
             },
-            "region_1": {
-                "type": "text",
-                "analyzer": "custom_analyzer",
-                "fields": {
-                    "raw": {
-                        "type": "keyword"
-                    }
-                }
+            "views": {
+                "type": "float"
             },
-            "region_2": {
-                "type": "text",
-                "analyzer": "custom_analyzer",
-                "fields": {
-                    "raw": {
-                        "type": "keyword"
-                    }
-                }
+            "paragraph_id": {
+                "type": "integer"
             },
-            "taster_name": {
-                "type": "text",
-                "analyzer": "custom_analyzer",
-                "fields": {
-                    "raw": {
-                        "type": "keyword"
-                    }
-                }
-            },
-            "taster_twitter_handle": {
-                "type": "keyword"
+            "langs": {
+                "type": "integer"
             },
             "vector": {
                 "type": "dense_vector",
-                "dims": 256,
+                "dims": 1024,
                 "index": true,
-                "similarity": "cosine"
+                "similarity": "cosine",
+                "index_options": {
+                    "type": "bbq_hnsw",
+                    "m": 32,
+                    "ef_construction": 200
+                }
             }
         }
     }
