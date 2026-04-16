@@ -11,5 +11,4 @@ class Settings(BaseSettings):
         ),
         extra="allow",
     )
-    lancedb_dir: str = "winemag"
-    embedding_model_checkpoint: str = "nomic-ai/modernbert-embed-base"
+    lancedb_dir: str = "wikipedia_db"

@@ -94,3 +94,5 @@ Extra flags for API benchmark:
 ```sh
 uv run lancedb/query.py
 ```
+
+

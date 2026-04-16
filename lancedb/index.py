@@ -1,4 +1,4 @@
-"""Create LanceDB FTS and IVF_PQ indexes after ingestion."""
+"""创建 LanceDB FTS 和 IVF_PQ 索引（导入数据后执行）。"""
 
 import argparse
 from functools import lru_cache
@@ -16,39 +16,39 @@ def get_settings() -> Settings:
 
 
 async def main() -> None:
-    parser = argparse.ArgumentParser("Create LanceDB indexes")
+    parser = argparse.ArgumentParser("创建 LanceDB 索引")
     parser.add_argument(
         "--num-partitions",
         type=int,
-        default=16,
-        help="Number of IVF partitions for IVF_PQ",
+        default=16384,
+        help="IVF 分区数（数据量大时建议增大）",
     )
     parser.add_argument(
         "--num-sub-vectors",
         type=int,
         default=64,
-        help="Number of PQ sub-vectors for IVF_PQ",
+        help="PQ 子向量数",
     )
     parser.add_argument(
         "--replace",
         action="store_true",
-        help="Replace existing indexes if they already exist",
+        help="替换已有索引",
     )
     args = parser.parse_args()
 
     settings = get_settings()
     db_uri = Path(__file__).resolve().parent / settings.lancedb_dir
     db = await lancedb.connect_async(str(db_uri))
-    table = await db.open_table("wines")
+    table = await db.open_table("wikipedia_dedup")
 
     fts_start = perf_counter()
     await table.create_index(
-        "description",
+        "text",
         config=FTS(),
-        replace=args.replace,
+        replace=True,
     )
     fts_elapsed = perf_counter() - fts_start
-    print(f"Created FTS index in {fts_elapsed:.4f}s")
+    print(f"FTS 索引创建完成，耗时 {fts_elapsed:.4f}s")
 
     ivfpq_start = perf_counter()
     await table.create_index(
@@ -58,12 +58,11 @@ async def main() -> None:
             num_partitions=args.num_partitions,
             num_sub_vectors=args.num_sub_vectors,
         ),
-        replace=args.replace,
+        replace=True,
     )
     ivfpq_elapsed = perf_counter() - ivfpq_start
     print(
-        "Created IVF_PQ index in "
-        f"{ivfpq_elapsed:.4f}s "
+        f"IVF_PQ 索引创建完成，耗时 {ivfpq_elapsed:.4f}s "
         f"(num_partitions={args.num_partitions}, num_sub_vectors={args.num_sub_vectors})"
     )
 

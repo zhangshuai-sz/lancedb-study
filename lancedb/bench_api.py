@@ -11,9 +11,8 @@ from aiohttp.client_exceptions import ContentTypeError
 
 QUERY_FILES = {
     "fts": "keyword_terms.txt",
-    "vector": "vector_terms.txt",
 }
-SEARCH_TYPES = ("fts", "vector")
+SEARCH_TYPES = ("fts",)
 NUM_QUERIES = 1000
 NUM_TRIALS = 3
 DEFAULT_SEED = 37

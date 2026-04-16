@@ -2,6 +2,7 @@
 
 import argparse
 import asyncio
+import gc
 import os
 import random
 import sys
@@ -11,19 +12,18 @@ from functools import lru_cache
 from pathlib import Path
 from time import perf_counter
 
-# Suppress verbose Rust-side Lance warnings in benchmark output.
+# 抑制 Rust 端的 Lance 警告
 os.environ.setdefault("RUST_LOG", "error")
 warnings.filterwarnings("ignore", category=DeprecationWarning, module="lancedb")
 
 import lancedb
-from sentence_transformers import SentenceTransformer
 
 try:
     from .config import Settings
 except ImportError:
     from config import Settings
 
-# 日志输出文件路径（固定位置）
+# 日志输出文件路径
 LOG_FILE = Path(__file__).resolve().parents[1] / "bench_output.log"
 
 QUERY_FILES = {
@@ -35,8 +35,8 @@ SEARCH_TYPES = ("fts", "vector", "hybrid")
 NUM_QUERIES = 1000
 NUM_TRIALS = 3
 DEFAULT_SEED = 37
-EMBEDDING_DIM = 256
-RESULT_COLUMNS = ["id", "title", "description", "country", "variety", "price", "points"]
+EMBEDDING_DIM = 1024
+RESULT_COLUMNS = ["id", "title", "text", "url", "wiki_id", "views", "paragraph_id", "langs"]
 FTS_RESULT_COLUMNS = [*RESULT_COLUMNS, "_score"]
 VECTOR_RESULT_COLUMNS = [*RESULT_COLUMNS, "_distance"]
 HYBRID_RESULT_COLUMNS = [*RESULT_COLUMNS, "_score"]
@@ -70,42 +70,37 @@ def percentile(values: list[float], p: float) -> float:
     return sorted_values[low] * (1.0 - weight) + sorted_values[high] * weight
 
 
+async def fetch_random_vectors(
+    table: lancedb.table.AsyncTable,
+    n: int,
+) -> list[list[float]]:
+    """从 LanceDB 表中随机抽取 n 条文档的向量，用作向量检索的查询向量。"""
+    import pyarrow.compute as pc
+
+    # 使用 LanceDB 的 sample 或直接取前 N 条的向量
+    result = await table.query().select(["vector"]).limit(n * 2).to_arrow()
+    vectors = result.column("vector").to_pylist()
+    if not vectors:
+        raise RuntimeError("无法从 LanceDB 中获取向量数据，请确认数据已导入")
+    # 随机打乱
+    random.shuffle(vectors)
+    return vectors[:n]
+
+
 async def run_lancedb_fts_query(table: lancedb.table.AsyncTable, query_text: str) -> bool:
     query = await table.search(
         query_text,
         query_type="fts",
-        fts_columns=["description"],
+        fts_columns=["text"],
     )
     result_table = await query.select(FTS_RESULT_COLUMNS).limit(10).to_arrow()
     return result_table.num_rows > 0
-
-
-def precompute_vectors(
-    model: SentenceTransformer,
-    query_texts: list[str],
-) -> dict[str, list[float]]:
-    """预先批量编码所有查询词向量，排除 model.encode() 对压测计时的影响。"""
-    vectors = {}
-    for text in set(query_texts):
-        vec = model.encode(
-            f"search_query: {text.strip().lower()}",
-            show_progress_bar=False,
-            convert_to_numpy=True,
-            truncate_dim=EMBEDDING_DIM,
-        )
-        if len(vec.shape) != 1 or vec.shape[0] != EMBEDDING_DIM:
-            raise ValueError(
-                f"Expected query embedding shape ({EMBEDDING_DIM},), got {vec.shape}"
-            )
-        vectors[text] = vec.astype("float32", copy=False).tolist()
-    return vectors
 
 
 async def run_lancedb_vector_query(
     table: lancedb.table.AsyncTable,
     query_vector: list[float],
 ) -> bool:
-    """纯检索压测：只计算 LanceDB 检索耗时，不包含 model.encode() 时间。"""
     query = await table.search(
         query_vector,
         vector_column_name="vector",
@@ -113,7 +108,7 @@ async def run_lancedb_vector_query(
     )
     result_table = await (
         query.distance_type("cosine")
-        .nprobes(10)
+        .nprobes(128)
         .select(VECTOR_RESULT_COLUMNS)
         .limit(10)
         .to_arrow()
@@ -126,16 +121,13 @@ async def run_lancedb_hybrid_query(
     query_text: str,
     query_vector: list[float],
 ) -> bool:
-    """混合检索压测：同时使用 FTS 文本检索和向量检索，由 LanceDB 融合排序。
-    直接使用底层 query() API 传入预计算向量，避免 search() 要求文本输入的限制。"""
     builder = (
         table.query()
         .nearest_to(query_vector)
         .column("vector")
         .distance_type("cosine")
-        .nprobes(10)
-        .nearest_to_text(query_text, columns=["description"])
-        .select(RESULT_COLUMNS)
+        .nprobes(32)
+        .nearest_to_text(query_text, columns=["text"])
         .limit(10)
     )
     result_table = await builder.to_arrow()
@@ -147,6 +139,8 @@ async def run_single_trial(
     warmup_queries: list[str],
     max_concurrency: int,
     query_runner,
+    batch_size: int | None = None,
+    progress_label: str = "",
 ) -> dict[str, float]:
     semaphore = asyncio.Semaphore(max_concurrency)
 
@@ -160,8 +154,29 @@ async def run_single_trial(
     if warmup_queries:
         await asyncio.gather(*(timed_query(query) for query in warmup_queries))
 
+    # 分批执行查询，避免一次性提交过多任务导致内存暴涨
+    batch_size = batch_size or len(sampled_queries)  # 默认不分批
+    total_queries = len(sampled_queries)
+    num_batches = (total_queries + batch_size - 1) // batch_size
     start_total = perf_counter()
-    results = await asyncio.gather(*(timed_query(query) for query in sampled_queries))
+    results = []
+    for i in range(0, total_queries, batch_size):
+        batch = sampled_queries[i : i + batch_size]
+        batch_results = await asyncio.gather(*(timed_query(query) for query in batch))
+        results.extend(batch_results)
+        # 分批模式下输出进度日志（仅当有多个批次时）
+        if num_batches > 1 and progress_label:
+            done = min(i + batch_size, total_queries)
+            elapsed_so_far = perf_counter() - start_total
+            batch_latencies = [lat for _, lat in batch_results]
+            avg_lat = sum(batch_latencies) / len(batch_latencies) if batch_latencies else 0
+            current_qps = done / elapsed_so_far if elapsed_so_far > 0 else 0
+            print(
+                f"  [{progress_label}] {done}/{total_queries} 完成 "
+                f"| 已耗时 {elapsed_so_far:.1f}s | 当前QPS {current_qps:.1f} "
+                f"| 本批avg {avg_lat:.1f}ms",
+                flush=True,
+            )
     elapsed_total = perf_counter() - start_total
 
     successes = sum(1 for ok, _ in results if ok)
@@ -187,11 +202,12 @@ def average_metrics(metrics_list: list[dict[str, float]]) -> dict[str, float]:
 
 async def run_benchmark(args: argparse.Namespace) -> None:
     settings = get_settings()
-    model = SentenceTransformer(settings.embedding_model_checkpoint)
 
-    db_uri = Path(__file__).resolve().parent / settings.lancedb_dir
-    db = await lancedb.connect_async(str(db_uri))
-    table = await db.open_table("wines")
+    db_uri = str(Path(__file__).resolve().parent / settings.lancedb_dir)
+
+    # 先连接一次，抽取向量数据（后续会关闭重连）
+    db = await lancedb.connect_async(db_uri)
+    table = await db.open_table("wikipedia_dedup")
 
     print(
         f"Average metrics over {NUM_TRIALS} direct-client runs "
@@ -203,46 +219,73 @@ async def run_benchmark(args: argparse.Namespace) -> None:
     )
     print("|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|")
 
-    # 三种检索类型共用同一份查询文本，保证压测对比的公平性
-    terms = get_query_terms("fts")  # 所有类型都使用 keyword_terms.txt
+    # 三种检索类型共用同一份查询文本
+    terms = get_query_terms("fts")
     rng = random.Random(args.seed)
     sampled_queries = rng.choices(terms, k=NUM_QUERIES)
     warmup_queries = [terms[j % len(terms)] for j in range(args.warmup_queries)]
 
-    # 预先批量编码所有查询词向量（向量检索和混合检索共用）
-    all_texts = list(set(sampled_queries + warmup_queries))
-    print(f"Pre-computing {len(all_texts)} unique query vectors (excluded from timing)...")
-    vector_cache = precompute_vectors(model, all_texts)
-    print("Vector pre-computation done.")
+    # 从 LanceDB 中随机抽取向量作为查询向量
+    print(f"从 LanceDB 中随机抽取 {NUM_QUERIES} 条向量用于向量检索 ...")
+    all_vectors = await fetch_random_vectors(table, NUM_QUERIES)
+    while len(all_vectors) < NUM_QUERIES:
+        all_vectors.extend(all_vectors[: NUM_QUERIES - len(all_vectors)])
+    all_vectors = all_vectors[:NUM_QUERIES]
+    query_vector_map = {q: all_vectors[i] for i, q in enumerate(sampled_queries)}
+    for j, wq in enumerate(warmup_queries):
+        if wq not in query_vector_map:
+            query_vector_map[wq] = all_vectors[j % len(all_vectors)]
+    print("向量准备完成。")
+
+    # 关闭初始连接，后续每种检索类型使用独立连接
+    db.close()
+    del table, db
+    gc.collect()
 
     for search_type in SEARCH_TYPES:
+        # 每种检索类型创建独立的数据库连接，避免 Rust 端缓存累积导致性能退化
+        db = await lancedb.connect_async(db_uri)
+        table = await db.open_table("wikipedia_dedup")
+
         if search_type == "fts":
             query_runner = lambda query: run_lancedb_fts_query(table, query)
         elif search_type == "vector":
-            query_runner = lambda query: run_lancedb_vector_query(table, vector_cache[query])
+            query_runner = lambda query: run_lancedb_vector_query(
+                table, query_vector_map[query]
+            )
         else:
-            query_runner = lambda query: run_lancedb_hybrid_query(table, query, vector_cache[query])
+            query_runner = lambda query: run_lancedb_hybrid_query(
+                table, query, query_vector_map[query]
+            )
+
+        concurrency = args.max_concurrency
+        batch = None  # 不分批，一次性提交
+
+        print(f"开始 {search_type} 压测（并发={concurrency}，batch={batch or 'all'}）...", flush=True)
 
         all_trial_metrics: list[dict[str, float]] = []
-        for _ in range(NUM_TRIALS):
-            all_trial_metrics.append(
-                await run_single_trial(
-                    sampled_queries=sampled_queries,
-                    warmup_queries=warmup_queries,
-                    max_concurrency=args.max_concurrency,
-                    query_runner=query_runner,
-                )
+        for trial_idx in range(NUM_TRIALS):
+            metrics = await run_single_trial(
+                sampled_queries=sampled_queries,
+                warmup_queries=warmup_queries,
+                max_concurrency=concurrency,
+                query_runner=query_runner,
+                batch_size=batch,
             )
+            all_trial_metrics.append(metrics)
+
+        # 每种检索类型完成后关闭连接并清理内存，释放 Rust 端缓存
+        db.close()
+        del table, db
+        gc.collect()
 
         avg = average_metrics(all_trial_metrics)
         print(
             f"| {search_type} | {NUM_QUERIES} | {NUM_TRIALS} | {avg['success']:.2f} | "
             f"{avg['elapsed_s']:.4f} | {avg['qps']:.2f} | {avg['p50_ms']:.2f} | "
-            f"{avg['p95_ms']:.2f} | {avg['p99_ms']:.2f} | {args.max_concurrency} | "
+            f"{avg['p95_ms']:.2f} | {avg['p99_ms']:.2f} | {concurrency} | "
             f"{args.seed} | {args.warmup_queries} |"
         )
-
-    db.close()
 
 
 if __name__ == "__main__":
