@@ -160,7 +160,7 @@ if __name__ == "__main__":
         default=DEFAULT_SEED,
         help="Random seed used for deterministic query sampling",
     )
-    parser.add_argument("--max-concurrency", type=int, default=16)
+    parser.add_argument("--max-concurrency", type=int, default=32)
     parser.add_argument(
         "--warmup-queries",
         type=int,

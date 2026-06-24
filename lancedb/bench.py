@@ -16,6 +16,13 @@ from time import perf_counter
 os.environ.setdefault("RUST_LOG", "error")
 warnings.filterwarnings("ignore", category=DeprecationWarning, module="lancedb")
 
+# 设置 Rust tokio 运行时的 worker 线程数，默认与容器 CPU 核数一致（32）
+# 必须在 import lancedb 之前设置，否则不生效
+#os.environ.setdefault("TOKIO_WORKER_THREADS", "32")
+
+# 设置 Lance CPU 计算线程数（IVF/PQ 等向量计算），默认与容器 CPU 核数一致（32）
+os.environ.setdefault("LANCE_CPU_THREADS", "32")
+
 import lancedb
 
 try:
@@ -258,7 +265,11 @@ async def run_benchmark(args: argparse.Namespace) -> None:
                 table, query, query_vector_map[query]
             )
 
-        concurrency = args.max_concurrency
+        # FTS 检索使用独立的更高并发（CPU 利用率低，有余量）
+        if search_type == "fts" and args.fts_concurrency is not None:
+            concurrency = args.fts_concurrency
+        else:
+            concurrency = args.max_concurrency
         batch = None  # 不分批，一次性提交
 
         print(f"开始 {search_type} 压测（并发={concurrency}，batch={batch or 'all'}）...", flush=True)
@@ -296,7 +307,13 @@ if __name__ == "__main__":
         default=DEFAULT_SEED,
         help="Random seed used for deterministic query sampling",
     )
-    parser.add_argument("--max-concurrency", type=int, default=16)
+    parser.add_argument("--max-concurrency", type=int, default=32)
+    parser.add_argument(
+        "--fts-concurrency",
+        type=int,
+        default=None,
+        help="FTS 检索的独立并发数（默认使用 --max-concurrency 的值）。FTS 计算量轻，可设置更高并发以提升 CPU 利用率",
+    )
     parser.add_argument(
         "--warmup-queries",
         type=int,
